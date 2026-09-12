@@ -47,7 +47,7 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 # --------------------------------------------------------------------------
@@ -64,7 +64,7 @@ from weather_api.weather import (  # noqa: E402
 _HERE = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(_HERE, "..", "models")
 SOLAR_CKPT_PATH = os.path.join(MODELS_DIR, "solar_power_model.pt")
-WIND_CKPT_PATH = os.path.join(MODELS_DIR, "best_model.pt")
+WIND_CKPT_PATH = os.path.join(MODELS_DIR, "wind_power_model.pt")
 
 CACHE_PATH = os.path.join(_HERE, ".pow_lag_cache.json")
 
@@ -135,22 +135,33 @@ def apply_wind_cutout_ceiling(pred, raw, cutout=WIND_CUT_OUT_SPEED):
 # Model architectures -- must match the two training scripts exactly so
 # the saved state_dict keys line up.
 # --------------------------------------------------------------------------
-class SolarPowerMLP(nn.Module):
-    """v1 architecture: plain Linear/ReLU/Dropout, no BatchNorm."""
+class PowerMLP(nn.Module):
+    """Unified MLP whose layout is chosen to match what a checkpoint was
+    actually trained with:
+      - use_batchnorm=False -> Linear/ReLU/Dropout only ("v1" layout)
+      - use_batchnorm=True  -> BatchNorm1d after every hidden Linear ("v2" layout)
+    Layer indices are built to line up exactly with both original classes,
+    so state_dict keys (net.0, net.1, ...) still match either checkpoint.
+    """
 
-    def __init__(self, in_dim, hidden=128):
+    def __init__(self, in_dim, hidden=128, use_batchnorm=False, dropout=0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden, hidden // 2),
-            nn.ReLU(),
-            nn.Linear(hidden // 2, 1),
-        )
+        layers = []
+
+        def block(in_f, out_f, with_dropout=True):
+            layers.append(nn.Linear(in_f, out_f))
+            if use_batchnorm:
+                layers.append(nn.BatchNorm1d(out_f))
+            layers.append(nn.ReLU())
+            if with_dropout:
+                layers.append(nn.Dropout(dropout))
+
+        block(in_dim, hidden)
+        block(hidden, hidden)
+        block(hidden, hidden // 2, with_dropout=False)
+        layers.append(nn.Linear(hidden // 2, 1))
+
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
@@ -179,8 +190,12 @@ class WindPowerMLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+def _detect_batchnorm_architecture(state_dict):
+    """BatchNorm1d layers save running_mean/running_var; a plain
+    Linear/ReLU/Dropout stack never has a 'net.1.running_mean' key."""
+    return "net.1.running_mean" in state_dict
 
-def _load_model(ckpt_path, model_cls, device):
+def _load_model(ckpt_path, device):
     try:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     except TypeError:
@@ -189,7 +204,9 @@ def _load_model(ckpt_path, model_cls, device):
     state_dict = ckpt["model_state_dict"]
     first_w = state_dict["net.0.weight"]  # shape: [hidden, in_dim]
     hidden, in_dim = first_w.shape
-    model = model_cls(in_dim=in_dim, hidden=hidden).to(device)
+    use_batchnorm = _detect_batchnorm_architecture(state_dict)
+
+    model = PowerMLP(in_dim=in_dim, hidden=hidden, use_batchnorm=use_batchnorm).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     return model, ckpt
@@ -330,9 +347,9 @@ _wind_model, _wind_ckpt = None, None
 def _ensure_models_loaded():
     global _solar_model, _solar_ckpt, _wind_model, _wind_ckpt
     if _solar_model is None:
-        _solar_model, _solar_ckpt = _load_model(SOLAR_CKPT_PATH, SolarPowerMLP, _DEVICE)
+        _solar_model, _solar_ckpt = _load_model(SOLAR_CKPT_PATH, _DEVICE)
     if _wind_model is None:
-        _wind_model, _wind_ckpt = _load_model(WIND_CKPT_PATH, WindPowerMLP, _DEVICE)
+        _wind_model, _wind_ckpt = _load_model(WIND_CKPT_PATH, _DEVICE)
 
 
 def predict_power(lat, lon, device=None, estimate_uncertainty=False):
@@ -383,7 +400,7 @@ def predict_power(lat, lon, device=None, estimate_uncertainty=False):
 # API layer -- FastAPI, no argparse. Run with:
 #   uvicorn predict_power:app --host 0.0.0.0 --port 8000
 # --------------------------------------------------------------------------
-app = FastAPI(title="Solar + Wind Power Prediction API")
+router = APIRouter()
 
 
 class PredictRequest(BaseModel):
@@ -392,12 +409,12 @@ class PredictRequest(BaseModel):
     uncertainty: bool = False
 
 
-@app.get("/health")
+@router.get("/health")
 def health():
     return {"status": "ok"}
 
 
-@app.get("/predict")
+@router.get("/predict")
 def predict_get(
     lat: float = Query(..., description="Latitude"),
     lon: float = Query(..., description="Longitude"),
@@ -409,7 +426,7 @@ def predict_get(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/predict")
+@router.post("/predict")
 def predict_post(req: PredictRequest):
     try:
         return predict_power(req.lat, req.lon, estimate_uncertainty=req.uncertainty)
