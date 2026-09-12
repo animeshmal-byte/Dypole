@@ -1,52 +1,65 @@
-def dispatch_energy(consumption, solar, wind, diesel_capacity=None):
+def dispatch_energy(consumption, solar, wind, battery_charge, battery_capacity, is_calamity=False):
     """
-    Decide how to meet energy consumption from solar, wind, and diesel.
+    Dispatch decision for a microgrid with solar, wind, diesel, and battery.
+
+    Normal mode priority: solar+wind -> battery -> diesel (diesel assumed always sufficient)
+    Calamity mode priority: solar+wind -> battery charging is the goal; diesel covers
+                             consumption; any renewable left after battery is full
+                             still offsets consumption before diesel does.
 
     Parameters:
-        consumption (float): required energy (x)
-        solar (float): energy produced by solar (y)
-        wind (float): energy produced by wind (z)
-        diesel_capacity (float, optional): max diesel can supply.
-            If None, assumed unlimited.
+        consumption (float): required load (x)
+        solar (float): solar production
+        wind (float): wind production
+        battery_charge (float): current battery charge level
+        battery_capacity (float): max battery capacity
+        is_calamity (bool): True if in storm-prep mode
 
     Returns:
-        dict with:
-            solar_used, wind_used, diesel_used,
-            battery_charge (excess renewable sent to battery),
-            unmet_demand (if diesel_capacity can't cover the gap)
+        dict with renewable_used, battery_used, battery_charged,
+        diesel_used, curtailed, new_battery_charge
     """
     renewable_total = solar + wind
 
     result = {
-        "solar_used": 0.0,
-        "wind_used": 0.0,
+        "renewable_used": 0.0,
+        "battery_used": 0.0,
+        "battery_charged": 0.0,
         "diesel_used": 0.0,
-        "battery_charge": 0.0,
-        "unmet_demand": 0.0,
+        "curtailed": 0.0,
+        "new_battery_charge": battery_charge,
     }
 
-    if renewable_total >= consumption:
-        # Case 1: renewable excess (or exact match) — no diesel needed
-        # Use solar first, then wind, to meet consumption
-        if solar >= consumption:
-            result["solar_used"] = consumption
-            result["wind_used"] = 0.0
+    if not is_calamity:
+        if renewable_total >= consumption:
+            # Renewables cover it fully; excess goes to battery (capped), rest curtailed
+            result["renewable_used"] = consumption
+            excess = renewable_total - consumption
+            room = battery_capacity - battery_charge
+            charged = min(excess, room)
+            result["battery_charged"] = charged
+            result["curtailed"] = excess - charged
+            result["new_battery_charge"] = battery_charge + charged
         else:
-            result["solar_used"] = solar
-            result["wind_used"] = consumption - solar
-
-        result["battery_charge"] = renewable_total - consumption
+            # Renewables fall short; battery covers the gap; diesel covers the rest
+            result["renewable_used"] = renewable_total
+            deficit = consumption - renewable_total
+            drawn = min(deficit, battery_charge)
+            result["battery_used"] = drawn
+            result["diesel_used"] = deficit - drawn
+            result["new_battery_charge"] = battery_charge - drawn
 
     else:
-        # Case 2: renewable deficit — diesel fills the gap
-        result["solar_used"] = solar
-        result["wind_used"] = wind
-        deficit = consumption - renewable_total
+        # Calamity: renewables prioritize charging the battery
+        room = battery_capacity - battery_charge
+        charged = min(renewable_total, room)
+        result["battery_charged"] = charged
+        result["new_battery_charge"] = battery_charge + charged
 
-        if diesel_capacity is None or diesel_capacity >= deficit:
-            result["diesel_used"] = deficit
-        else:
-            result["diesel_used"] = diesel_capacity
-            result["unmet_demand"] = deficit - diesel_capacity
+        leftover_renewable = renewable_total - charged
+        renewable_to_consumption = min(leftover_renewable, consumption)
+        result["renewable_used"] = renewable_to_consumption
+        result["diesel_used"] = consumption - renewable_to_consumption
+        result["curtailed"] = leftover_renewable - renewable_to_consumption
 
     return result

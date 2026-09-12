@@ -65,7 +65,7 @@ from weather_api.weather import (  # noqa: E402
 _HERE = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(_HERE, "..", "models")
 SOLAR_CKPT_PATH = os.path.join(MODELS_DIR, "solar_power_model.pt")
-WIND_CKPT_PATH = os.path.join(MODELS_DIR, "wind_power_model.pt")
+WIND_CKPT_PATH = os.path.join(MODELS_DIR, "best_model.pt")
 
 CACHE_PATH = os.path.join(_HERE, ".pow_lag_cache.json")
 
