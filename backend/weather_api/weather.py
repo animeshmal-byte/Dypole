@@ -1,4 +1,11 @@
-import argparse
+"""
+weather_api/weather.py
+
+Fetches current weather for a lat/lon from Open-Meteo and shapes it into
+the two model input schemas (solar + wind). Pure library module now --
+no CLI/argparse entry point, since this is called from the API layer in
+backend/predict_power.py.
+"""
 import requests
 
 # ---- Target schemas -------------------------------------------------
@@ -45,27 +52,13 @@ def fetch_current(lat: float, lon: float) -> dict:
         "Air temperature (°C)": current["temperature_2m"],
         "Atmosphere (hpa)": current["surface_pressure"],
         "Relative humidity (%)": current["relative_humidity_2m"],
-        TARGET_COL: None, #output
+        TARGET_COL: None,  # output
 
         # wind model features
         "wind_speed": current["wind_speed_10m"],
         "temp": current["temperature_2m"],
         "prs": current["surface_pressure"],
         "hum%": current["relative_humidity_2m"],
-        POW_TARGET_COL: None, #output
+        POW_TARGET_COL: None,  # output
     }
     return result
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--lat", type=float, required=True)
-    parser.add_argument("--lon", type=float, required=True)
-    args = parser.parse_args()
-
-    data = fetch_current(args.lat, args.lon)
-    print(data)
-
-
-if __name__ == "__main__":
-    main()

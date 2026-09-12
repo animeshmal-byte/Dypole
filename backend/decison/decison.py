@@ -1,4 +1,4 @@
-def dispatch_energy(consumption, solar, wind, battery_charge, battery_capacity, is_calamity=False):
+def dispatch_energy(consumption, solar, wind, battery_charge, battery_capacity, is_calamity=False, result=None):
     """
     Dispatch decision for a microgrid with solar, wind, diesel, and battery.
 
@@ -19,16 +19,18 @@ def dispatch_energy(consumption, solar, wind, battery_charge, battery_capacity, 
         dict with renewable_used, battery_used, battery_charged,
         diesel_used, curtailed, new_battery_charge
     """
-    renewable_total = solar + wind
+    if not result:
+        result = {
+            "renewable_used": 0.0,
+            "battery_used": 0.0,
+            "battery_charged": 0.0,
+            "diesel_used": 0.0,
+            "curtailed": 0.0,
+            "new_battery_charge": battery_charge,
+        }
 
-    result = {
-        "renewable_used": 0.0,
-        "battery_used": 0.0,
-        "battery_charged": 0.0,
-        "diesel_used": 0.0,
-        "curtailed": 0.0,
-        "new_battery_charge": battery_charge,
-    }
+
+    renewable_total = solar + wind
 
     if not is_calamity:
         if renewable_total >= consumption:

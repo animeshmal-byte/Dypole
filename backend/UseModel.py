@@ -2,9 +2,10 @@
 """
 predict_power.py
 
-Fetches current weather for a lat/lon (via weather_api.weather.fetch_current),
-runs it through the trained solar and wind power models, fills in the two
-`None` output placeholders, and returns the modified dict.
+FastAPI service. POST/GET a lat/lon, it fetches current weather (via
+weather_api.weather.fetch_current), runs it through the trained solar and
+wind power models, fills in the two `None` output placeholders, and
+returns the modified dict as JSON.
 
 Both models are autoregressive: they were trained on the *previous* power
 reading as an input feature (power_lag_1/2/3 for solar, pow_out_lag for
@@ -14,35 +15,31 @@ such history on its own, so this script keeps a small JSON cache on disk
 lag inputs on the next run. On the very first run for a given location,
 lags are bootstrapped to 0.0.
 
-CHANGES FROM v1 (OOD safety):
+OOD safety (unchanged from the CLI version):
     1. check_in_distribution() -- flags any raw input feature that falls
        outside the same sanity ranges the two training scripts used to
-       DROP rows during cleaning. If training would have thrown a row
-       away, inference has no business trusting a prediction on it
-       either. Warnings are attached to the output under "_warnings"
-       instead of silently trusting an extrapolated number.
+       DROP rows during cleaning. Warnings are attached to the response
+       under "_warnings" instead of silently trusting an extrapolated
+       number.
     2. apply_solar_physics_floor() -- solar output is hard-clamped to 0.0
-       whenever all three irradiance features are <= 0 (i.e. night).
-       This is real physics, not something worth leaving to the network
-       to infer purely statistically.
+       whenever all three irradiance features are <= 0 (night).
     3. apply_wind_cutout_ceiling() -- wind output is hard-clamped to 0.0
-       once wind_speed reaches/exceeds a cut-out threshold, mirroring the
-       cut-in check the training script already enforces on the low end.
-       Without this, wind_speed_sq/cub features just keep extrapolating
-       upward past the point real turbines shut down for safety.
+       once wind_speed reaches/exceeds a cut-out threshold.
     4. predict_with_uncertainty() -- optional MC-dropout uncertainty
-       estimate (mean + std over several stochastic forward passes) so a
-       caller can see when the model is unsure, e.g. on inputs near/at
-       the edges of VALID_RANGES.
+       estimate (mean + std over several stochastic forward passes).
 
 Place this file at backend/predict_power.py so the relative paths to
 ../models/*.pt and ./weather_api/weather.py resolve correctly.
 
-Usage:
-    python predict_power.py --lat 28.6 --lon 77.2
+Run it:
+    uvicorn predict_power:app --host 0.0.0.0 --port 8000
+
+Then call it:
+    GET  http://localhost:8000/predict?lat=28.6&lon=77.2
+    GET  http://localhost:8000/predict?lat=28.6&lon=77.2&uncertainty=true
+    POST http://localhost:8000/predict   body: {"lat": 28.6, "lon": 77.2}
 """
 
-import argparse
 import json
 import os
 import sys
@@ -50,6 +47,8 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 
 # --------------------------------------------------------------------------
 # Wire up to weather_api/weather.py (fetch_current + the shared column
@@ -72,9 +71,7 @@ CACHE_PATH = os.path.join(_HERE, ".pow_lag_cache.json")
 
 # --------------------------------------------------------------------------
 # Sanity ranges -- MUST stay in sync with VALID_RANGES in
-# train_solar_power_model.py and train_wind_power_model.py. If training
-# would have dropped a row for being outside these bounds, inference has
-# no business trusting a prediction on it either.
+# train_solar_power_model.py and train_wind_power_model.py.
 # --------------------------------------------------------------------------
 WEATHER_VALID_RANGES = {
     # wind-model raw feature names
@@ -104,9 +101,7 @@ WIND_CUT_OUT_SPEED = 25.0
 
 def check_in_distribution(raw, ranges=WEATHER_VALID_RANGES):
     """Return a list of human-readable warnings for any raw weather value
-    that falls outside the ranges used to clean the training data. An
-    empty list means the input looks like something the model actually
-    trained on."""
+    that falls outside the ranges used to clean the training data."""
     warnings = []
     for col, (lo, hi) in ranges.items():
         if col not in raw:
@@ -120,8 +115,7 @@ def check_in_distribution(raw, ranges=WEATHER_VALID_RANGES):
 
 
 def apply_solar_physics_floor(pred, raw):
-    """Hard physics constraint: no sunlight in -> no power out, regardless
-    of what the network extrapolated."""
+    """Hard physics constraint: no sunlight in -> no power out."""
     irradiance_vals = [raw.get(c) for c in SOLAR_IRRADIANCE_COLS]
     if all(v is not None and v <= 0 for v in irradiance_vals):
         return 0.0
@@ -130,9 +124,7 @@ def apply_solar_physics_floor(pred, raw):
 
 def apply_wind_cutout_ceiling(pred, raw, cutout=WIND_CUT_OUT_SPEED):
     """Hard physics constraint: turbines feather/shut down at high wind
-    speed for safety, so power should collapse toward zero past cut-out --
-    not keep climbing the way an unconstrained ws^2/ws^3 extrapolation
-    would suggest."""
+    speed for safety."""
     ws = raw.get("wind_speed")
     if ws is not None and ws >= cutout:
         return 0.0
@@ -144,8 +136,7 @@ def apply_wind_cutout_ceiling(pred, raw, cutout=WIND_CUT_OUT_SPEED):
 # the saved state_dict keys line up.
 # --------------------------------------------------------------------------
 class SolarPowerMLP(nn.Module):
-    """v1 architecture (train_solar_power_model.py): plain Linear/ReLU/Dropout,
-    no BatchNorm."""
+    """v1 architecture: plain Linear/ReLU/Dropout, no BatchNorm."""
 
     def __init__(self, in_dim, hidden=128):
         super().__init__()
@@ -166,8 +157,7 @@ class SolarPowerMLP(nn.Module):
 
 
 class WindPowerMLP(nn.Module):
-    """v2 architecture (train_wind_power_model.py): BatchNorm after every
-    Linear layer."""
+    """v2 architecture: BatchNorm after every Linear layer."""
 
     def __init__(self, in_dim, hidden=128):
         super().__init__()
@@ -194,7 +184,6 @@ def _load_model(ckpt_path, model_cls, device):
     try:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     except TypeError:
-        # older torch versions don't have the weights_only kwarg
         ckpt = torch.load(ckpt_path, map_location=device)
 
     state_dict = ckpt["model_state_dict"]
@@ -224,23 +213,34 @@ def _predict(model, ckpt, feature_vec, device):
     return float(pred.reshape(-1)[0])
 
 
+def _enable_mc_dropout(model):
+    """Flip ONLY Dropout layers into train mode; everything else (notably
+    BatchNorm) stays in eval mode so it keeps using its saved running
+    stats. Calling plain model.train() would also put BatchNorm into
+    training mode, which computes stats from the current batch -- and
+    crashes on a batch of size 1 (a single live prediction) with
+    'Expected more than 1 value per channel when training'."""
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.train()
+
+
 def _predict_with_uncertainty(model, ckpt, feature_vec, device, n_samples=30):
     """Same as _predict, but runs n_samples stochastic forward passes with
-    dropout left active (model.train()) to get a cheap mean/std estimate.
-    A wide std on a given input is itself a signal the model is unsure --
-    useful alongside check_in_distribution() for borderline inputs."""
+    dropout left active to get a cheap mean/std estimate. Safe for
+    BatchNorm architectures at batch size 1 -- see _enable_mc_dropout."""
     x = np.asarray(feature_vec, dtype=np.float32).reshape(1, -1)
     x_mean, x_std = ckpt["x_mean"], ckpt["x_std"]
     y_mean, y_std = ckpt["y_mean"], ckpt["y_std"]
     x_scaled = torch.from_numpy(((x - x_mean) / x_std).astype(np.float32)).to(device)
 
-    was_training = model.training
-    model.train()  # keep dropout active; BatchNorm still uses running stats fine on repeated calls
+    model.eval()          # BatchNorm (if any) uses running stats
+    _enable_mc_dropout(model)  # ...but Dropout layers still sample
     preds = []
     with torch.no_grad():
         for _ in range(n_samples):
             preds.append(model(x_scaled).cpu().numpy())
-    model.train(was_training)
+    model.eval()  # restore fully clean eval state for subsequent normal predictions
 
     preds = np.stack(preds).reshape(n_samples)
     preds_unscaled = preds * y_std.reshape(-1)[0] + y_mean.reshape(-1)[0]
@@ -317,10 +317,27 @@ def build_wind_feature_vec(raw, ckpt, pow_out_lag):
 
 
 # --------------------------------------------------------------------------
-# Main
+# Core prediction logic -- unchanged from the CLI version, just no longer
+# called from an argparse main().
 # --------------------------------------------------------------------------
+_DEVICE = torch.device("cpu")
+
+# Models are loaded once per process, not once per request.
+_solar_model, _solar_ckpt = None, None
+_wind_model, _wind_ckpt = None, None
+
+
+def _ensure_models_loaded():
+    global _solar_model, _solar_ckpt, _wind_model, _wind_ckpt
+    if _solar_model is None:
+        _solar_model, _solar_ckpt = _load_model(SOLAR_CKPT_PATH, SolarPowerMLP, _DEVICE)
+    if _wind_model is None:
+        _wind_model, _wind_ckpt = _load_model(WIND_CKPT_PATH, WindPowerMLP, _DEVICE)
+
+
 def predict_power(lat, lon, device=None, estimate_uncertainty=False):
-    device = device or torch.device("cpu")
+    device = device or _DEVICE
+    _ensure_models_loaded()
 
     raw = fetch_current(lat, lon)
 
@@ -328,18 +345,15 @@ def predict_power(lat, lon, device=None, estimate_uncertainty=False):
     # is trusted -- if training would have dropped this row, we say so.
     ood_warnings = check_in_distribution(raw)
 
-    solar_model, solar_ckpt = _load_model(SOLAR_CKPT_PATH, SolarPowerMLP, device)
-    wind_model, wind_ckpt = _load_model(WIND_CKPT_PATH, WindPowerMLP, device)
-
     cache = _load_cache()
     state = _get_location_state(cache, lat, lon)
 
-    solar_vec = build_solar_feature_vec(raw, solar_ckpt, state["solar_power_history"])
-    solar_pred = _predict(solar_model, solar_ckpt, solar_vec, device)
+    solar_vec = build_solar_feature_vec(raw, _solar_ckpt, state["solar_power_history"])
+    solar_pred = _predict(_solar_model, _solar_ckpt, solar_vec, device)
     solar_pred = apply_solar_physics_floor(solar_pred, raw)
 
-    wind_vec = build_wind_feature_vec(raw, wind_ckpt, state["wind_pow_out_lag"])
-    wind_pred = _predict(wind_model, wind_ckpt, wind_vec, device)
+    wind_vec = build_wind_feature_vec(raw, _wind_ckpt, state["wind_pow_out_lag"])
+    wind_pred = _predict(_wind_model, _wind_ckpt, wind_vec, device)
     wind_pred = apply_wind_cutout_ceiling(wind_pred, raw)
 
     raw[TARGET_COL] = solar_pred
@@ -349,14 +363,14 @@ def predict_power(lat, lon, device=None, estimate_uncertainty=False):
         raw["_warnings"] = ood_warnings
 
     if estimate_uncertainty:
-        _, solar_std = _predict_with_uncertainty(solar_model, solar_ckpt, solar_vec, device)
-        _, wind_std = _predict_with_uncertainty(wind_model, wind_ckpt, wind_vec, device)
+        _, solar_std = _predict_with_uncertainty(_solar_model, _solar_ckpt, solar_vec, device)
+        _, wind_std = _predict_with_uncertainty(_wind_model, _wind_ckpt, wind_vec, device)
         raw["_uncertainty"] = {
             f"{TARGET_COL}_std": solar_std,
             f"{POW_TARGET_COL}_std": wind_std,
         }
 
-    max_lag = max(solar_ckpt.get("lags", [1, 2, 3]))
+    max_lag = max(_solar_ckpt.get("lags", [1, 2, 3]))
     state["solar_power_history"] = (state["solar_power_history"] + [solar_pred])[-max_lag:]
     state["wind_pow_out_lag"] = wind_pred
     _set_location_state(cache, lat, lon, state)
@@ -365,26 +379,39 @@ def predict_power(lat, lon, device=None, estimate_uncertainty=False):
     return raw
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--lat", type=float, required=True)
-    parser.add_argument("--lon", type=float, required=True)
-    parser.add_argument("--cuda", action="store_true", help="Use CUDA if available")
-    parser.add_argument("--uncertainty", action="store_true",
-                         help="Also estimate prediction std via MC-dropout")
-    args = parser.parse_args()
-
-    device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
-    result = predict_power(args.lat, args.lon, device=device,
-                            estimate_uncertainty=args.uncertainty)
-
-    if "_warnings" in result:
-        print("WARNING: this prediction is extrapolating outside training data:")
-        for w in result["_warnings"]:
-            print("  -", w)
-
-    print(result)
+# --------------------------------------------------------------------------
+# API layer -- FastAPI, no argparse. Run with:
+#   uvicorn predict_power:app --host 0.0.0.0 --port 8000
+# --------------------------------------------------------------------------
+app = FastAPI(title="Solar + Wind Power Prediction API")
 
 
-if __name__ == "__main__":
-    main()
+class PredictRequest(BaseModel):
+    lat: float
+    lon: float
+    uncertainty: bool = False
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/predict")
+def predict_get(
+    lat: float = Query(..., description="Latitude"),
+    lon: float = Query(..., description="Longitude"),
+    uncertainty: bool = Query(False, description="Also return MC-dropout uncertainty"),
+):
+    try:
+        return predict_power(lat, lon, estimate_uncertainty=uncertainty)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/predict")
+def predict_post(req: PredictRequest):
+    try:
+        return predict_power(req.lat, req.lon, estimate_uncertainty=req.uncertainty)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
