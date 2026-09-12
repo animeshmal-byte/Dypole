@@ -45,14 +45,14 @@ def fetch_current(lat: float, lon: float) -> dict:
         "Air temperature (°C)": current["temperature_2m"],
         "Atmosphere (hpa)": current["surface_pressure"],
         "Relative humidity (%)": current["relative_humidity_2m"],
-        TARGET_COL: None,  # not available from weather API
+        TARGET_COL: None, #output
 
         # wind model features
         "wind_speed": current["wind_speed_10m"],
         "temp": current["temperature_2m"],
         "prs": current["surface_pressure"],
         "hum%": current["relative_humidity_2m"],
-        POW_TARGET_COL: None,  # not available from weather API
+        POW_TARGET_COL: None, #output
     }
     return result
 
