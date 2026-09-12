@@ -1,16 +1,82 @@
-# React + Vite
+# Maitri Power Control (DyPole SCADA Telemetry Hub)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Polar Microgrid Telemetry & Power Dispatch Control Dashboard for Antarctic Research Station Operations.
 
-Currently, two official plugins are available:
+## 🚀 Quick Start
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+### 1. Run the Frontend (Standalone Mock Mode Enabled)
+```bash
+npm install
+npm run dev
+```
+Open [http://localhost:5173](http://localhost:5173) in your browser.
 
-## React Compiler
+The dashboard runs **100% standalone** out of the box with built-in scenario toggles:
+- **MOCK NORMAL**: 92% renewable, high solar & wind generation, optimal battery autonomy, normal status.
+- **MOCK BLIZZARD**: Emergency katabatic blizzard scenario, 0% solar, diesel generation dispatched, critical storm alerts.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+---
 
-## Expanding the ESLint configuration
+### 2. Optional: Run the Local JSON/HTTP Mock Server
+If you want to test live HTTP polling against `GET /status` and `GET /schedule` on `http://localhost:8000`:
+```bash
+npm run mock:server
+```
+Endpoints provided:
+- `GET http://localhost:8000/status`
+- `GET http://localhost:8000/schedule`
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+---
+
+### 3. Connecting to Real Backend API
+Set the `VITE_API_BASE_URL` in `.env` or pass it in your environment:
+```env
+VITE_API_BASE_URL=http://your-real-backend:8000
+```
+Then select the **LIVE API** toggle in the dashboard control bar. The app will automatically poll `/status` and `/schedule` every **30 seconds** (configurable in `src/services/api.ts`).
+
+---
+
+## 🛠️ Data Contract Reference
+
+### `GET /status`
+```json
+{
+  "severity": "normal" | "warning" | "emergency",
+  "battery": {
+    "capacity_kwh": 5.4,
+    "usable_kwh": 2.6,
+    "current_kwh": 3.3,
+    "discharge_kw": 1.1
+  },
+  "diesel_health": 78,
+  "restock_days_remaining": 4
+}
+```
+
+### `GET /schedule` (12 hourly objects)
+```json
+[
+  {
+    "hour": 0,
+    "diesel_kw": 0,
+    "solar_kw": 2.1,
+    "wind_kw": 1.4,
+    "battery_kw": 0,
+    "demand_kw": 3.0,
+    "battery_soc_after": 3.3,
+    "reason": "Solar and wind cover demand"
+  }
+]
+```
+
+---
+
+## 🧩 Modular Components
+- `SourceMixCard.tsx`: Current Generation Dispatch Donut chart with Wind, Solar PV, BESS, and Diesel breakdown.
+- `LoadForecastChart.tsx`: 24-Hour Predictive Energy Modeling (Actual vs Forecasted Load) with 95.4% Confidence Interval and threshold markers.
+- `BatteryCard.tsx`: BESS Storage Array with segmented State of Charge (SOC) meter and run autonomy calculator.
+- `DieselHealthCard.tsx`: Diesel Gen health index, 30-day erosion sparkline, and fuel reserve tracking.
+- `AlertBanner.tsx`: Priority Operational Alerts & live event journal with timestamped tags (`T-10M`, `T-1H 12M`, etc.).
+- `ScheduleMatrixChart.tsx`: Stacked area/bar telemetry matrix color-coded by source (warm amber diesel, cool cyan/blue solar/wind/battery).
+- `AllocationTimeline.tsx`: Timestamped dispatch decision log showing newest-first reason strings.
