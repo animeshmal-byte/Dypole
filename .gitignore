@@ -28,3 +28,5 @@ dist-ssr
 .env
 .venv
 dist/
+.pow_lag_cache.json
+__pycache__/
