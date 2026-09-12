@@ -27,3 +27,4 @@ dist-ssr
 .git
 .env
 .venv
+dist/
